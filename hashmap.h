@@ -1,3 +1,16 @@
+/*
+ * Hashtable using linear probing with simd instructions for optimizations
+ * NEON simd ops are inspired by this blog: https://developer.arm.com/community/arm-community-blogs/b/servers-and-cloud-computing-blog/posts/porting-x86-vector-bitmask-optimizations-to-arm-neon
+ * AVX ops are easier and just written by me
+ * supports insert delete and at functionality
+ */
+
+
+
+
+
+
+
 #ifndef SIMD_HASHMAP_LIBRARY_H
 #define SIMD_HASHMAP_LIBRARY_H
 #include <functional>
@@ -19,6 +32,8 @@ using match_type = uint64_t;
 #include <immintrin.h>
 using match_type = uint32_t
 #define HASH_SIMD_SIZE 32
+#else
+#error "needs simd support"
 #endif
 
 namespace hashmap {
@@ -83,12 +98,12 @@ namespace hashmap {
         }
 
 #if HASH_HAS_NEON
-        //HEAVILY inspired by this: https://developer.arm.com/community/arm-community-blogs/b/servers-and-cloud-computing-blog/posts/porting-x86-vector-bitmask-optimizations-to-arm-neon
         match_type vec_to_bitmask(uint8x16_t vec) {
             const uint16x8_t equalMask = vreinterpretq_u16_u8(vec);
             const uint8x8_t res = vshrn_n_u16(equalMask, 4);
             return vget_lane_u64(vreinterpret_u64_u8(res), 0);
         }
+#elif HASH_HAS_AVX2
 #endif
 
         match_type match_hash(const std::byte* group, uint8_t h2) {
