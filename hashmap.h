@@ -1,16 +1,9 @@
 /*
  * Hashtable using linear probing with simd instructions for optimizations
  * NEON simd ops are inspired by this blog: https://developer.arm.com/community/arm-community-blogs/b/servers-and-cloud-computing-blog/posts/porting-x86-vector-bitmask-optimizations-to-arm-neon
- * AVX ops are easier and just written by me
+ * AVX ops are easier so yeah
  * supports insert delete and at functionality
  */
-
-
-
-
-
-
-
 #ifndef SIMD_HASHMAP_LIBRARY_H
 #define SIMD_HASHMAP_LIBRARY_H
 #include <functional>
