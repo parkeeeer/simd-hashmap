@@ -1,6 +1,6 @@
 #include <benchmark/benchmark.h>
 #include <unordered_map>
-#include "hashmap.h"
+#include "hashmap.hpp"
 #include <random>
 
 
@@ -22,7 +22,7 @@ BENCHMARK(BM_StdHashMap_Insert)->Range(64, 1<<20)->Complexity();
 static void BM_YourHashMap_Insert(benchmark::State& state) {
     std::mt19937 rng(42);
     for (auto _ : state) {
-        hashmap::HashMap<int, int> map;
+        hm::HashMap<int, int> map;
         for (int i = 0; i < state.range(0); ++i) {
             map.insert(rng(), i);
         }
@@ -34,7 +34,7 @@ BENCHMARK(BM_YourHashMap_Insert)->Range(64, 1<<20)->Complexity();
 
 // Benchmark lookup
 static void BM_YourHashMap_Lookup(benchmark::State& state) {
-    hashmap::HashMap<int, int> map;
+    hm::HashMap<int, int> map;
     std::mt19937 rng(42);
     std::vector<int> keys;
     

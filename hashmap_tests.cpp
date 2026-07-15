@@ -1,8 +1,8 @@
 #include <gtest/gtest.h>
-#include "hashmap.h"
+#include "hashmap.hpp"
 
 TEST(HashMapTest, BasicInsertAndFind) {
-    hashmap::HashMap<int, std::string> map;
+    hm::HashMap<int, std::string> map;
 
     EXPECT_TRUE(map.insert(1, "one"));
     EXPECT_EQ(map.at(1), "one");
@@ -10,7 +10,7 @@ TEST(HashMapTest, BasicInsertAndFind) {
 }
 
 TEST(HashMapTest, InsertDuplicate) {
-    hashmap::HashMap<int, int> map;
+    hm::HashMap<int, int> map;
 
     EXPECT_TRUE(map.insert(5, 10));
     EXPECT_FALSE(map.insert(5, 20));
@@ -18,7 +18,7 @@ TEST(HashMapTest, InsertDuplicate) {
 }
 
 TEST(HashMapTest, Erase) {
-    hashmap::HashMap<int, int> map;
+    hm::HashMap<int, int> map;
 
     map.insert(1, 100);
     EXPECT_TRUE(map.erase(1));
@@ -26,7 +26,7 @@ TEST(HashMapTest, Erase) {
 }
 
 TEST(HashMapTest, MultipleInserts) {
-    hashmap::HashMap<int, int> map;
+    hm::HashMap<int, int> map;
 
     for (int i = 0; i < 100; ++i) {
         EXPECT_TRUE(map.insert(i, i * 10));
@@ -44,7 +44,7 @@ TEST(HashMapTest, MultipleInserts) {
 }
 
 TEST(HashMapTest, EraseAndReinsert) {
-    hashmap::HashMap<int, int> map;
+    hm::HashMap<int, int> map;
 
     map.insert(1, 100);
     map.erase(1);

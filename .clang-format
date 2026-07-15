@@ -1,0 +1,49 @@
+---
+Language: Cpp
+BasedOnStyle: Google
+
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+
+# Braces on their own line for functions/classes, same-line for control flow.
+# (Set BreakBeforeBraces: Allman instead if you want braces on their own
+# line everywhere, including if/for/while.)
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterFunction: false
+  AfterClass: false
+  AfterStruct: false
+  AfterEnum: false
+  AfterNamespace: false
+  AfterControlStatement: false
+  BeforeElse: false
+  SplitEmptyFunction: false
+  SplitEmptyRecord: false
+
+PointerAlignment: Left      # int* x, not int *x
+ReferenceAlignment: Left
+AlignAfterOpenBracket: Align
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+AlignTrailingComments: true
+
+AllowShortFunctionsOnASingleLine: true
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+
+BinPackArguments: false
+BinPackParameters: false
+NamespaceIndentation: None   # don't indent everything inside namespace {}
+
+SortIncludes: true
+IncludeBlocks: Regroup
+
+SpaceBeforeParens: ControlStatements
+SpacesInAngles: false
+Cpp11BracedListStyle: true
+
+IndentCaseLabels: true
+AccessModifierOffset: -2
