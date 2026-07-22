@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+
 #include "hashmap.hpp"
 
 TEST(HashMapTest, BasicInsertAndFind) {
@@ -22,7 +23,7 @@ TEST(HashMapTest, Erase) {
 
     map.insert(1, 100);
     EXPECT_TRUE(map.erase(1));
-    EXPECT_THROW(map.at(1), std::out_of_range);
+    EXPECT_FALSE((map.at(1).has_value()));
 }
 
 TEST(HashMapTest, MultipleInserts) {

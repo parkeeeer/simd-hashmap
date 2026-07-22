@@ -6,30 +6,17 @@
  * supports insert delete and at functionality
  */
 
-// TODO wrote the simd abstraction file I should definitely make it use those and not this ugly ass
-// code
 #ifndef SIMD_HASHMAP_LIBRARY_H
 #define SIMD_HASHMAP_LIBRARY_H
 #include <bitset>
 #include <cstdint>
 #include <functional>
 #include <iostream>
+#include <optional>
 #include <utility>
 #include <vector>
 
-#ifdef __ARM_NEON
-#define HASH_HAS_NEON 1
-#include <arm_neon.h>
-using match_type = uint64_t;
-#define HASH_SIMD_SIZE 16
-#elif defined(__AVX2__)  // avx2 is needed for the 8 bit comparison ops
-#define HASH_HAS_AVX2 1
-#include <immintrin.h>
-using match_type = uint32_t;
-#define HASH_SIMD_SIZE 32
-#else
-#error "needs simd support"
-#endif
+#include "simd_group.hpp"
 
 namespace hm {
 
@@ -39,10 +26,12 @@ template <typename Key,
           typename allocator = std::allocator<std::pair<Key, Value>>>
 class HashMap {
     // all and masks
-    static constexpr std::byte deleted_mask{0b001};
-    static constexpr std::byte empty_mask{0b100};
-    static constexpr std::byte occupied_mask{0b011};
-    static constexpr std::byte in_progress_mask{0b100};
+
+    using Group = simd::Group;
+    static constexpr std::byte deleted_mask{0b01};
+    static constexpr std::byte empty_mask{0b10};
+    static constexpr std::byte occupied_mask{0b11};
+    static constexpr std::byte in_progress_mask{0b00};
     std::vector<std::byte> buckets;
     std::vector<std::pair<Key, Value>, allocator> values;
     Hash hasher;
@@ -50,24 +39,23 @@ class HashMap {
     size_t load{0};  // occupied plus deleted
   public:
     HashMap()
-        : buckets(std::vector<std::byte>(64, empty_mask)),
+        : buckets(std::vector<std::byte>(Group::width * 4, empty_mask)),
           hasher(Hash()),
-          values(std::vector<std::pair<Key, Value>, allocator>(64)) {}
+          values(std::vector<std::pair<Key, Value>, allocator>(Group::width * 4)) {}
     HashMap(const HashMap&) = default;
     HashMap(HashMap&&) noexcept = default;
     ~HashMap() = default;
     HashMap& operator=(const HashMap&) = default;
     HashMap& operator=(HashMap&&) noexcept = default;
 
-    bool insert(const Key& key, const Value& value) { return insert_impl(key, value); }
+    bool insert(const Key& key, const Value& value) noexcept { return insert_impl(key, value); }
 
-    bool erase(const Key& key) { return delete_impl(key); }
+    bool erase(const Key& key) noexcept { return delete_impl(key); }
 
-    Value& at(const Key& key) { return at_impl(key); }
-    const Value& at(const Key& key) const { return at_impl(key); }
+    std::optional<Value> at(const Key& key) noexcept { return at_impl(key); }
 
-    [[nodiscard]] size_t size() const { return _size; }
-    [[nodiscard]] bool empty() const { return _size == 0; }
+    [[nodiscard]] size_t size() const noexcept { return _size; }
+    [[nodiscard]] bool empty() const noexcept { return _size == 0; }
 
   private:
     void print_current_state() const {
@@ -79,9 +67,9 @@ class HashMap {
     }
 
     void rehash_if_needed() {
-        if (load * 8 > buckets.capacity() * 7) {
+        if (load * 8 > buckets.size() * 7) {
             size_t new_size =
-                ((buckets.capacity() * 2 + HASH_SIMD_SIZE - 1) / HASH_SIMD_SIZE) * HASH_SIMD_SIZE;
+                ((buckets.size() * 2 + Group::width - 1) / Group::width) * Group::width;
             std::vector<std::byte> old_buckets(std::move(buckets));
             std::vector<std::pair<Key, Value>, allocator> old_values(std::move(values));
             buckets.resize(new_size, empty_mask);
@@ -96,76 +84,31 @@ class HashMap {
         }
     }
 
-#if HASH_HAS_NEON
-    match_type vec_to_bitmask(uint8x16_t vec) {
-        const uint16x8_t equalMask = vreinterpretq_u16_u8(vec);
-        const uint8x8_t res = vshrn_n_u16(equalMask, 4);
-        return vget_lane_u64(vreinterpret_u64_u8(res), 0);
-    }
-#elif HASH_HAS_AVX2
-#endif
-
-    match_type match_hash(const std::byte* group, uint8_t h2) {
-#if HASH_HAS_NEON
-        uint8x16_t vec = vld1q_u8(reinterpret_cast<const uint8_t*>(group));
-        uint8_t target = (h2 << 2) | 3;
-        uint8x16_t target_vec = vdupq_n_u8(target);
-        uint8x16_t cmp = vceqq_u8(vec, target_vec);
-        return vec_to_bitmask(cmp);
-#endif
-    }
-
-    match_type match_empty(const std::byte* group) {
-#if HASH_HAS_NEON
-        uint8x16_t vec = vld1q_u8(reinterpret_cast<const uint8_t*>(group));
-        uint8_t target = 0b10;
-        uint8x16_t target_vec = vdupq_n_u8(target);
-        // vec = vandq_u8(vec, target_vec);
-        uint8x16_t cmp = vceqq_u8(vec, target_vec);
-        return vec_to_bitmask(cmp);
-#endif
-    }
-
-    match_type match_deleted(const std::byte* group) {
-#if HASH_HAS_NEON
-        uint8x16_t vec = vld1q_u8(reinterpret_cast<const uint8_t*>(group));
-        uint8_t target = 0b01;
-        uint8x16_t target_vec = vdupq_n_u8(target);
-        // vec = vandq_u8(vec, target_vec);
-        uint8x16_t cmp = vceqq_u8(vec, target_vec);
-        return vec_to_bitmask(cmp);
-#endif
-    }
+    static uint8_t occupied_tag(uint8_t h2) { return static_cast<uint8_t>((h2 << 2) | 0b11); }
 
     bool insert_impl(const Key& key, const Value& value) {
         rehash_if_needed();
-        size_t num_groups = buckets.capacity() / HASH_SIMD_SIZE;
+        size_t num_groups = buckets.size() / Group::width;
         size_t hash = hasher(key);
         size_t index = hash % buckets.size();
         uint8_t h2 = (hash >> 23) & 0b111111;
         uint8_t insertion = h2 << 2 | 3;
-        size_t group_index = index / HASH_SIMD_SIZE;
+        size_t group_index = index / Group::width;
         while (true) {
-            size_t start_group = group_index * HASH_SIMD_SIZE;
-            const std::byte* group = buckets.data() + start_group;
+            size_t start_group = group_index * Group::width;
+            Group group = Group::load(buckets.data() + start_group);
 
-            match_type mask = match_hash(group, h2);
-            while (mask) {
-                int slot = __builtin_ctzll(mask) >> 2;
+            for (int slot : group.match_byte(occupied_tag(h2))) {
                 size_t idx = start_group + slot;
                 if (values[idx].first == key) {
-                    return false;  // key exists
+                    return false;  // key already exists
                 }
-                mask &= mask - 1;
             }
 
-            match_type empty_match = match_empty(group);
-            match_type deleted_match = match_deleted(group);
-            mask = empty_match | deleted_match;
-            if (mask) {
-                int slot = __builtin_ctzll(mask) >> 2;
-                size_t idx = start_group + slot;
-                buckets[idx] = std::byte{insertion};
+            simd::Bitmask empty_or_deleted{group.match_empty().raw() | group.match_deleted().raw()};
+            if (empty_or_deleted.any()) {
+                size_t idx = start_group + empty_or_deleted.lowest();
+                buckets[idx] = std::byte{occupied_tag(h2)};
                 values[idx] = std::make_pair(key, value);
                 ++_size;
                 ++load;
@@ -175,59 +118,49 @@ class HashMap {
         }
     }
 
-    Value& at_impl(const Key& key) {
-        size_t num_groups = buckets.capacity() / HASH_SIMD_SIZE;
+    std::optional<Value> at_impl(const Key& key) {
+        size_t num_groups = buckets.size() / Group::width;
         size_t hash = hasher(key);
         size_t index = hash % buckets.size();
         uint8_t h2 = (hash >> 23) & 0b111111;
-        size_t group_index = index / HASH_SIMD_SIZE;
+        size_t group_index = index / Group::width;
         for (size_t i{0}; i < num_groups; ++i) {
-            size_t start_group = group_index * HASH_SIMD_SIZE;
-            const std::byte* group = buckets.data() + start_group;
-            match_type mask = match_hash(group, h2);
-            while (mask) {
-                int slot = __builtin_ctzll(mask) >> 2;
+            size_t start_group = group_index * Group::width;
+            Group group = Group::load(buckets.data() + start_group);
+
+            for (int slot : group.match_byte(occupied_tag(h2))) {
                 size_t idx = start_group + slot;
                 if (values[idx].first == key) {
                     return values[idx].second;
                 }
-                mask &= mask - 1;
             }
-            match_type empty = match_empty(group);
-            if (empty) {
-                throw std::out_of_range("Key not found");
+            if (group.match_empty().any()) {
+                return std::nullopt;
             }
             group_index = (group_index + 1) % num_groups;
         }
-        throw std::out_of_range("key not found");
+        return std::nullopt;
     }
 
     bool delete_impl(const Key& key) {
-        size_t num_groups = buckets.capacity() / HASH_SIMD_SIZE;
+        size_t num_groups = buckets.size() / Group::width;
         size_t hash = hasher(key);
         size_t index = hash % buckets.size();
         uint8_t h2 = (hash >> 23) & 0b111111;
-        size_t group_index = index / HASH_SIMD_SIZE;
+        size_t group_index = index / Group::width;
         for (size_t i{0}; i < num_groups; ++i) {
-            size_t start_group = group_index * HASH_SIMD_SIZE;
-            const std::byte* group = buckets.data() + start_group;
-            match_type mask = match_hash(group, h2);
-            if (!mask) {
-                return false;
-            }
-            while (mask) {
-                int slot = __builtin_ctzll(mask) >> 2;
+            size_t start_group = group_index * Group::width;
+            Group group = Group::load(buckets.data() + start_group);
+
+            for (int slot : group.match_byte(occupied_tag(h2))) {
                 size_t idx = start_group + slot;
                 if (values[idx].first == key) {
                     buckets[idx] = deleted_mask;
                     --_size;
                     return true;
                 }
-                mask &= mask - 1;
             }
-
-            match_type empty = match_empty(group);
-            if (empty) {
+            if (group.match_empty().any()) {
                 return false;
             }
             group_index = (group_index + 1) % num_groups;
