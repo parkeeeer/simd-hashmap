@@ -23,7 +23,7 @@ TEST(HashMapTest, Erase) {
 
     map.insert(1, 100);
     EXPECT_TRUE(map.erase(1));
-    EXPECT_FALSE((map.at(1).has_value()));
+    EXPECT_FALSE(map.at(1));
 }
 
 TEST(HashMapTest, MultipleInserts) {
