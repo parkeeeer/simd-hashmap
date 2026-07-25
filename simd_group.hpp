@@ -46,7 +46,7 @@ class Bitmask {
         if constexpr (BitsPerSlot == 1) {
             return __builtin_ctz(mask);
         } else {
-            return __builtin_ctzll(mask);
+            return __builtin_ctzll(mask) / BitsPerSlot;
         }
     }
 
@@ -93,7 +93,7 @@ class Group {
 
     static Group load(const std::byte* pos) {
 #ifdef __ARM_NEON
-        return Group{v1d1q_u8(reinterperet_cast<const uint8_t*>(pos))};
+        return Group{vld1q_u8(reinterpret_cast<const uint8_t*>(pos))};
 #elif defined(__AVX2__)
         return Group{_mm256_loadu_si256(reinterpret_cast<const __m256i*>(pos))};
 #endif
@@ -102,7 +102,7 @@ class Group {
     [[nodiscard]] Bitmask match_byte(uint8_t tag) const {
 #ifdef __ARM_NEON
         uint8x16_t target = vdupq_n_u8(tag);
-        uint8x16_t cmp = vceqq_u8(vec_, target);
+        uint8x16_t cmp = vceqq_u8(vec, target);
         return Bitmask{to_nibble_mask(cmp)};
 #elif defined(__AVX2__)
         __m256i target = _mm256_set1_epi8(static_cast<char>(tag));
