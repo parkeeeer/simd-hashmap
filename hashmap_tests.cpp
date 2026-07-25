@@ -52,3 +52,11 @@ TEST(HashMapTest, EraseAndReinsert) {
     EXPECT_TRUE(map.insert(1, 200));
     EXPECT_EQ(map.at(1), 200);
 }
+
+TEST(HashMapTest, BasicWrite) {
+    hm::HashMap<int, int> map;
+    map.insert(1, 100);
+    EXPECT_EQ(map.at(1), 100);
+    map.write(1, 120);
+    EXPECT_EQ(map.at(1), 120);
+}

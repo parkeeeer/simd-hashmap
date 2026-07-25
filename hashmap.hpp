@@ -52,6 +52,8 @@ class HashMap {
 
     bool erase(const Key& key) noexcept { return delete_impl(key); }
 
+    bool write(const Key& key, const Value& value) { return write_impl(key, value); }
+
     std::optional<Value> at(const Key& key) noexcept { return at_impl(key); }
 
     [[nodiscard]] size_t size() const noexcept { return _size; }
@@ -157,6 +159,31 @@ class HashMap {
                 if (values[idx].first == key) {
                     buckets[idx] = deleted_mask;
                     --_size;
+                    return true;
+                }
+            }
+            if (group.match_empty().any()) {
+                return false;
+            }
+            group_index = (group_index + 1) % num_groups;
+        }
+        return false;
+    }
+
+    bool write_impl(const Key& key, const Value& value) {
+        size_t num_groups = buckets.size() / Group::width;
+        size_t hash = hasher(key);
+        size_t index = hash % buckets.size();
+        uint8_t h2 = (hash >> 23) & 0b111111;
+        size_t group_index = index / Group::width;
+        for (size_t i{0}; i < num_groups; ++i) {
+            size_t start_group = group_index * Group::width;
+            Group group = Group::load(buckets.data() + start_group);
+
+            for (int slot : group.match_byte(occupied_tag(h2))) {
+                size_t idx = start_group + slot;
+                if (values[idx].first == key) {
+                    values[idx].second = value;
                     return true;
                 }
             }
