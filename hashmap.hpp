@@ -10,9 +10,11 @@
 #define SIMD_HASHMAP_LIBRARY_H
 #include <atomic>
 #include <bitset>
+#include <cassert>
 #include <cstdint>
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <thread>
 #include <utility>
@@ -51,7 +53,7 @@ class HashMap {
     std::atomic<size_t> load{0};  // occupied plus deleted
   public:
     HashMap()
-        : buckets(std::vector<std::byte>(Group::width * GroupsPerChunk)),
+        : buckets(std::vector<tag_t>(Group::width * GroupsPerChunk)),
           hasher(Hash()),
           values(std::vector<std::pair<Key, Value>, allocator>(Group::width * GroupsPerChunk)) {}
     HashMap(const HashMap&) = default;
@@ -89,17 +91,21 @@ class HashMap {
 
     void rehash_if_needed() {
         if (load.load() * 8 > buckets.size() * 7) {
-            size_t new_size =
-                ((buckets.size() * 2 + Group::width - 1) / Group::width) * Group::width;
-            std::vector<std::byte> old_buckets(std::move(buckets));
-            std::vector<std::pair<Key, Value>, allocator> old_values(std::move(values));
-            buckets.resize(new_size, empty_mask);
-            values.resize(new_size);
-            _size.store(0);
-            load.store(0);
-            for (size_t i{0}; i < old_buckets.size(); ++i) {
-                if ((old_buckets[i] & occupied_mask) == occupied_mask) {
-                    insert_impl(old_values[i].first, old_values[i].second);
+            if constexpr (concurrent) {
+                try_init_resize();
+            } else {
+                size_t new_size =
+                    ((buckets.size() * 2 + Group::width - 1) / Group::width) * Group::width;
+                std::vector<tag_t> old_buckets(std::move(buckets));
+                std::vector<std::pair<Key, Value>, allocator> old_values(std::move(values));
+                buckets.resize(new_size);
+                values.resize(new_size);
+                _size.store(0);
+                load.store(0);
+                for (size_t i{0}; i < old_buckets.size(); ++i) {
+                    if ((old_buckets[i] & occupied_mask) == occupied_mask) {
+                        insert_impl(old_values[i].first, old_values[i].second);
+                    }
                 }
             }
         }
@@ -140,7 +146,7 @@ class HashMap {
                     }
                     // can safely own idx now
                     values[idx] = std::make_pair(key, value);
-                    buckets[idx].store(std::byte{occupied_tag(h2)}, std::memory_order_relaxed);
+                    buckets[idx].store(std::byte{occupied_tag(h2)}, std::memory_order_release);
                 } else {
                     buckets[idx] = std::byte{occupied_tag(h2)};
                     values[idx] = std::make_pair(key, value);
@@ -154,6 +160,7 @@ class HashMap {
     }
 
     std::optional<Value> at_impl(const Key& key) {
+        rehash_if_needed();
         size_t num_groups = buckets.size() / Group::width;
         size_t hash = hasher(key);
         size_t index = hash % buckets.size();
@@ -184,6 +191,7 @@ class HashMap {
     }
 
     bool delete_impl(const Key& key) {
+        rehash_if_needed();
         size_t num_groups = buckets.size() / Group::width;
         size_t hash = hasher(key);
         size_t index = hash % buckets.size();
@@ -195,7 +203,7 @@ class HashMap {
 
             for (int slot : group.match_byte(occupied_tag(h2))) {
                 size_t idx = start_group + slot;
-                if (values[idx] != key)
+                if (values[idx].first != key)
                     continue;
                 if constexpr (concurrent) {
                     std::byte expected{occupied_tag(h2)};
@@ -221,11 +229,12 @@ class HashMap {
 
     template <typename F>
     bool write_impl(const Key& key, F&& mutator) {
+        rehash_if_needed();
         size_t num_groups = buckets.size() / Group::width;
         size_t hash = hasher(key);
         uint8_t h2 = static_cast<uint8_t>((hash >> 23) & 0b111111);
         uint8_t tag = occupied_tag(h2);
-        size_t group_index = (hash / buckets.size()) / Group::width;
+        size_t group_index = (hash % buckets.size()) / Group::width;
 
         for (size_t i{0}; i < num_groups; ++i) {
             size_t start = group_index * Group::width;
@@ -233,7 +242,7 @@ class HashMap {
 
             for (int slot : group.match_byte(tag)) {
                 size_t idx = start + slot;
-                if (values[idx] != key) {
+                if (values[idx].first != key) {
                     continue;
                 }
 
@@ -242,10 +251,10 @@ class HashMap {
                     if (current != std::byte{tag}) {
                         break;
                     }
-                    if (!buckets.compare_exchange_string(current,
-                                                         in_progress_mask,
-                                                         std::memory_order_acq_rel,
-                                                         std::memory_order_relaxed)) {
+                    if (!buckets[idx].compare_exchange_strong(current,
+                                                              in_progress_mask,
+                                                              std::memory_order_acq_rel,
+                                                              std::memory_order_relaxed)) {
                         break;
                     }
                     mutator(values[idx].second);
@@ -274,64 +283,130 @@ class HashMap {
         std::atomic<size_t> chunks_remaining;
     };
 
-    std::atomic<ResizeState*> active_resize{nullptr};
+    std::atomic<std::shared_ptr<ResizeState>> active_resize{nullptr};
 
     // this function will set up the ResizeState so that the hash table can be correctly rehashed
     // and avoid race conditions
     void try_init_resize() {
-        ResizeState* state = active_resize.load(std::memory_order_acquire);
+        std::shared_ptr<ResizeState> state = active_resize.load(std::memory_order_acquire);
         if (!state) {
             // no resize started, try to set it up
+            size_t num_chunks = buckets.size() / (Group::width * GroupsPerChunk);
+            std::shared_ptr<ResizeState> candidate = std::make_shared<ResizeState>(
+                std::vector<std::atomic<std::byte>>(buckets.size() * 2),
+                std::vector<std::pair<Key, Value>>(buckets.size() * 2),
+                num_chunks,
+                num_chunks);
 
-            ResizeState* candidate =
-                new ResizeState{std::vector<std::atomic<std::byte>>(buckets.size() * 2),
-                                std::vector<std::pair<Key, Value>>(buckets.size() * 2),
-                                std::atomic<size_t>((buckets.size() * 2) / Group::width),
-                                std::atomic<size_t>((buckets.size() * 2) / Group::width)};
-
-            ResizeState* expected = nullptr;
+            std::shared_ptr<ResizeState> expected = nullptr;
 
             if (active_resize.compare_exchange_strong(
                     expected, candidate, std::memory_order_acq_rel, std::memory_order_relaxed)) {
                 // we won!!!!
                 state = candidate;
             } else {
-                delete candidate;
                 state = expected;
             }
         }
 
-        help_migrate(*state);
+        help_migrate(state);
     }
 
-    void help_migrate(ResizeState& state) {
+    void help_migrate(std::shared_ptr<ResizeState> state) {
         while (true) {
-            size_t claimed = state.next_chunk.fetch_sub(1, std::memory_order_acq_rel);
+            size_t claimed = state->next_chunk.fetch_sub(1, std::memory_order_acq_rel);
             if (claimed == 0) {
-                state.next_chunk.fetch_add(1, std::memory_order_relaxed);
-                while (active_resize.load(std::memory_order_acquire)) {
+                state->next_chunk.fetch_add(1, std::memory_order_relaxed);
+                while (active_resize.load(std::memory_order_acquire) == state) {
                     std::this_thread::yield();
                 }
                 return;
             }
 
             size_t chunk_id = claimed - 1;
-            migrate_all_slots_in_chunk(state, chunk_id);
-            if (state.chunks_remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                finish_resize(state);
+            migrate_all_slots_in_chunk(*state, chunk_id);
+            if (state->chunks_remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                finish_resize(*state);
+                return;
             }
         }
     }
 
     void migrate_all_slots_in_chunk(ResizeState& state, size_t chunk_id) {
-        size_t idx = chunk_id * GroupsPerChunk * Group::width;
+        size_t start = chunk_id * GroupsPerChunk * Group::width;
 
-        for (size_t i{0}; i < GroupsPerChunk; ++i) {
-            Group group = Group::load(buckets.data() + idx);
+        for (size_t g{0}; g < GroupsPerChunk; ++g) {
+            size_t group_start = start + g * Group::width;
+            Group group = Group::load(buckets.data() + group_start);
+
+            for (int slot : group.match_occupied()) {
+                size_t old_idx = group_start + slot;
+
+                constexpr int max_attempts = 64;
+                for (int attempt = 0; attempt < max_attempts; ++attempt) {
+                    std::byte current = buckets[old_idx].load(std::memory_order_acquire);
+                    std::byte low2 = (current)&std::byte(0b11);
+
+                    if (low2 != occupied_mask) {
+                        if (current == in_progress_mask) {
+                            std::this_thread::yield();
+                            continue;
+                        }
+                        break;
+                    }
+
+                    if (buckets[old_idx].compare_exchange_strong(current,
+                                                                 in_progress_mask,
+                                                                 std::memory_order_acq_rel,
+                                                                 std::memory_order_relaxed)) {
+                        const auto& [key, value] = values[old_idx];
+                        insert_into_new_table(state, key, value);
+                        break;
+                    }
+
+                    if (attempt == max_attempts - 1) {
+                        assert(false && "migration retry exhausted, lost data");
+                    }
+                }
+            }
         }
     }
 
-    void finish_resize() {}
+    void insert_into_new_table(ResizeState& state, const Key& key, const Value& value) {
+        size_t num_groups = state.new_buckets.size() / Group::width;
+        size_t hash = hasher(key);
+        uint8_t h2 = static_cast<uint8_t>((hash >> 23) & 0b111111);
+        size_t group_index = (hash % state.new_buckets.size()) / Group::width;
+
+        while (true) {
+            size_t start = group_index * Group::width;
+            Group group = Group::load(state.new_buckets.data() + start);
+
+            simd::Bitmask empty = group.match_empty();
+            if (empty.any()) {
+                size_t idx = start + empty.lowest();
+                std::byte expected{empty_mask};
+                if (state.new_buckets[idx].compare_exchange_strong(expected,
+                                                                   in_progress_mask,
+                                                                   std::memory_order_acq_rel,
+                                                                   std::memory_order_relaxed)) {
+                    state.new_values[idx] = std::make_pair(key, value);
+                    state.new_buckets[idx].store(std::byte{occupied_tag(h2)},
+                                                 std::memory_order_release);
+                    return;
+                }
+                continue;
+            }
+            group_index = (group_index + 1) % num_groups;
+        }
+    }
+
+    void finish_resize(ResizeState& state) {
+        buckets = std::move(state.new_buckets);
+        values = std::move(state.new_values);
+
+        active_resize.store(nullptr, std::memory_order_release);
+    }
 };
 }  // namespace hm
 

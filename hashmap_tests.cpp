@@ -3,7 +3,7 @@
 #include "hashmap.hpp"
 
 TEST(HashMapTest, BasicInsertAndFind) {
-    hm::HashMap<int, std::string> map;
+    hm::HashMap<int, std::string, false> map;
 
     EXPECT_TRUE(map.insert(1, "one"));
     EXPECT_EQ(map.at(1), "one");

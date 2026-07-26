@@ -128,8 +128,24 @@ class Group {
 #endif
     }
 
-    [[nodiscard]] Bitmask match_empty() const { return match_byte(0b10); }
+    [[nodiscard]] Bitmask match_empty() const { return match_byte(0b00); }
     [[nodiscard]] Bitmask match_deleted() const { return match_byte(0b01); }
+
+    [[nodiscard]] Bitmask match_occupied() const {
+#ifdef __ARM_NEON
+        uint8x16_t mask = vdupq_n_u8(0b11);
+        uint8x16_t masked = vandq_u8(vec, mask);
+        uint8x16_t target = vdupq_n_u8(0b11);
+        uint8x16_t cmp = vceqq_u8(masked, target);
+        return Bitmask{to_nibble_mask(cmp)};
+#elif defined(__AVX2__)
+        __m256i mask = _mm256_set1_epi8(0b11);
+        __m256i masked = _mm256_and_si256(vec, mask);
+        __m256i target = _mm256_set1_epi8(0b11);
+        __m256i cmp = _mm256_cmpeq_epi8(masked, target);
+        return Bitmask{static_cast<uint32_t>(_mm256_movemask_epi8(cmp))};
+#endif
+    }
 
   private:
     explicit Group(vec_type v) : vec(v) {}
