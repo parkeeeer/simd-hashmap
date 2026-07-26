@@ -7,6 +7,7 @@
  * intrinsics in it so I made this file to abstract it away
  */
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -96,6 +97,22 @@ class Group {
         return Group{vld1q_u8(reinterpret_cast<const uint8_t*>(pos))};
 #elif defined(__AVX2__)
         return Group{_mm256_loadu_si256(reinterpret_cast<const __m256i*>(pos))};
+#endif
+    }
+
+    static Group load(const std::atomic<std::byte>* pos) {
+#ifdef __ARM_NEON
+        std::byte temp_arr[16];
+        for (size_t i{0}; i < 16; ++i) {
+            temp_arr[i] = pos[i].load();
+        }
+        return load(temp_arr);
+#elif defined(__AVX2__)
+        std::byte temp_arr[32];
+        for (size_t i{0}; i < 32; ++i) {
+            temp_arr[i] = pos[i].load();
+        }
+        return load(temp_arr);
 #endif
     }
 
