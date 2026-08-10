@@ -11,6 +11,7 @@
 #include <atomic>
 #include <bitset>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <iostream>
@@ -29,7 +30,6 @@ template <typename Key,
           bool concurrent = true,
           size_t LoadFactorNumerator = 7,
           size_t LoadFactorDenominator = 8,
-          size_t GroupsPerChunk = 8,
           typename Hash = std::hash<Key>,
           typename allocator = std::allocator<std::pair<Key, Value>>>
 class HashMap {
@@ -37,49 +37,64 @@ class HashMap {
                   "hm::HashMap requires trivially copyable Value types under "
                   "concurrent access -- large/owning types risk torn reads. "
                   "Store a pointer, index, or shared_ptr<T> instead.");
-    static_assert((GroupsPerChunk & (GroupsPerChunk - 1)) == 0,
-                  "GroupsPerChunk should be a power of two so ChunkSize divides "
-                  "any power-of-two capacity produced by doubling");
+ 
     using tag_t = std::conditional_t<concurrent, std::atomic<std::byte>, std::byte>;
     using Group = simd::Group;
-    static constexpr std::byte deleted_mask{0b01};
-    static constexpr std::byte empty_mask{0b00};
-    static constexpr std::byte occupied_mask{0b11};
-    static constexpr std::byte in_progress_mask{0b10};
+ 
+    // Non-concurrent only ever needs EMPTY/DELETED/OCCUPIED (2 bits,
+    // one pattern to spare). Concurrent needs those plus IN_PROGRESS
+    // and (eventually) MOVED -- one extra bit, at the cost of one bit
+    // of hash tag. Computed per-instantiation so a single-threaded user
+    // never pays for a state their instantiation can't reach.
+    static constexpr int state_bits = concurrent ? 3 : 2;
+    static constexpr int tag_bits = 8 - state_bits;
+    static constexpr uint8_t tag_mask = static_cast<uint8_t>((1u << tag_bits) - 1);
+    static constexpr uint8_t state_all_ones = static_cast<uint8_t>((1u << state_bits) - 1);
+ 
+    static constexpr std::byte empty_mask{0b000};
+    static constexpr std::byte deleted_mask{0b001};
+    static constexpr std::byte in_progress_mask{0b010};  // concurrent only
+    static constexpr std::byte moved_mask{0b011};        // concurrent only, not yet wired up
+ 
+    static uint8_t occupied_tag(uint8_t h2) {
+        return static_cast<uint8_t>(((h2 & tag_mask) << state_bits) | state_all_ones);
+    }
+ 
     std::vector<tag_t> buckets;
     std::vector<std::pair<Key, Value>, allocator> values;
     Hash hasher;
     std::atomic<size_t> _size{0};
     std::atomic<size_t> load{0};  // occupied plus deleted
+ 
   public:
     HashMap()
-        : buckets(std::vector<tag_t>(Group::width * GroupsPerChunk)),
-          hasher(Hash()),
-          values(std::vector<std::pair<Key, Value>, allocator>(Group::width * GroupsPerChunk)) {}
+        : buckets(std::vector<tag_t>(Group::width * 4)),
+          values(std::vector<std::pair<Key, Value>, allocator>(Group::width * 4)),
+          hasher(Hash()) {}
     HashMap(const HashMap&) = default;
     HashMap(HashMap&&) noexcept = default;
     ~HashMap() = default;
     HashMap& operator=(const HashMap&) = default;
     HashMap& operator=(HashMap&&) noexcept = default;
-
-    bool insert(const Key& key, const Value& value) noexcept { return insert_impl(key, value); }
-
+ 
+    bool insert(const Key& key, const Value& value) { return insert_impl(key, value); }
+ 
     bool erase(const Key& key) noexcept { return delete_impl(key); }
-
+ 
     bool write(const Key& key, const Value& value) {
         return write_impl(key, [&value](Value& slot) { slot = value; });
     }
-
+ 
     template <typename F>
     bool update(const Key& key, F&& mutator) {
         return write_impl(key, std::forward<F>(mutator));
     }
-
+ 
     std::optional<Value> at(const Key& key) noexcept { return at_impl(key); }
-
+ 
     [[nodiscard]] size_t size() const noexcept { return _size.load(); }
     [[nodiscard]] bool empty() const noexcept { return _size.load() == 0; }
-
+ 
   private:
     void print_current_state() const {
         std::cout << "buckets: ";
@@ -88,11 +103,24 @@ class HashMap {
         }
         std::cout << '\n';
     }
-
+ 
+    // Concurrent path: resizing was moved up to ConcurrentHashMap's
+    // chain-of-submaps design entirely. A submap here is meant to be
+    // fixed-capacity -- if this fires, it means either the map wasn't
+    // sized appropriately up front, or something is using this class
+    // directly instead of through the chain wrapper.
+    //
+    // Non-concurrent path: plain, single-threaded rehash. No races to
+    // worry about, so no CAS/chunk machinery needed at all.
     void rehash_if_needed() {
-        if (load.load() * 8 > buckets.size() * 7) {
+        if (load.load(std::memory_order_relaxed) * LoadFactorDenominator >
+            buckets.size() * LoadFactorNumerator) {
             if constexpr (concurrent) {
-                try_init_resize();
+                throw std::logic_error(
+                    "hm::HashMap<..., concurrent=true> attempted to resize -- "
+                    "concurrent resize is not supported. Size the map "
+                    "appropriately up front, or use hm::ConcurrentHashMap "
+                    "for unbounded growth.");
             } else {
                 size_t new_size =
                     ((buckets.size() * 2 + Group::width - 1) / Group::width) * Group::width;
@@ -102,40 +130,37 @@ class HashMap {
                 values.resize(new_size);
                 _size.store(0);
                 load.store(0);
-                for (size_t i{0}; i < old_buckets.size(); ++i) {
-                    if ((old_buckets[i] & occupied_mask) == occupied_mask) {
+                for (size_t i = 0; i < old_buckets.size(); ++i) {
+                    uint8_t low_bits = static_cast<uint8_t>(old_buckets[i]) & state_all_ones;
+                    if (low_bits == state_all_ones) {  // occupied
                         insert_impl(old_values[i].first, old_values[i].second);
                     }
                 }
             }
         }
     }
-
-    static uint8_t occupied_tag(uint8_t h2) { return static_cast<uint8_t>((h2 << 2) | 0b11); }
-
+ 
     bool insert_impl(const Key& key, const Value& value) {
         rehash_if_needed();
         size_t num_groups = buckets.size() / Group::width;
         size_t hash = hasher(key);
-        size_t index = hash % buckets.size();
-        uint8_t h2 = (hash >> 23) & 0b111111;
-        uint8_t insertion = h2 << 2 | 3;
-        size_t group_index = index / Group::width;
+        uint8_t h2 = static_cast<uint8_t>((hash >> 23) & tag_mask);
+        size_t group_index = (hash % buckets.size()) / Group::width;
         while (true) {
             size_t start_group = group_index * Group::width;
             Group group = Group::load(buckets.data() + start_group);
-
+ 
             for (int slot : group.match_byte(occupied_tag(h2))) {
                 size_t idx = start_group + slot;
                 if (values[idx].first == key) {
                     return false;  // key already exists
                 }
             }
-
+ 
             simd::Bitmask empty_or_deleted{group.match_empty().raw() | group.match_deleted().raw()};
             if (empty_or_deleted.any()) {
                 size_t idx = start_group + empty_or_deleted.lowest();
-
+ 
                 if constexpr (concurrent) {
                     std::byte expected = buckets[idx].load(std::memory_order_acquire);
                     if (!buckets[idx].compare_exchange_strong(expected,
@@ -158,20 +183,23 @@ class HashMap {
             group_index = (group_index + 1) % num_groups;
         }
     }
-
+ 
     std::optional<Value> at_impl(const Key& key) {
-        rehash_if_needed();
+        // NOTE: lookups do NOT call rehash_if_needed -- reads should
+        // never throw or trigger a resize. If this were ever wired to
+        // the concurrent path, a lookup finding the load factor tripped
+        // just means "somebody needs to grow this soon," not something
+        // a read should act on itself.
         size_t num_groups = buckets.size() / Group::width;
         size_t hash = hasher(key);
-        size_t index = hash % buckets.size();
-        uint8_t h2 = (hash >> 23) & 0b111111;
+        uint8_t h2 = static_cast<uint8_t>((hash >> 23) & tag_mask);
         uint8_t tag = occupied_tag(h2);
-        size_t group_index = index / Group::width;
-        for (size_t i{0}; i < num_groups; ++i) {
+        size_t group_index = (hash % buckets.size()) / Group::width;
+        for (size_t i = 0; i < num_groups; ++i) {
             size_t start_group = group_index * Group::width;
             Group group = Group::load(buckets.data() + start_group);
-
-            for (int slot : group.match_byte(occupied_tag(h2))) {
+ 
+            for (int slot : group.match_byte(tag)) {
                 size_t idx = start_group + slot;
                 if constexpr (concurrent) {
                     if (buckets[idx].load(std::memory_order_acquire) != std::byte{tag}) {
@@ -189,22 +217,19 @@ class HashMap {
         }
         return std::nullopt;
     }
-
+ 
     bool delete_impl(const Key& key) {
-        rehash_if_needed();
         size_t num_groups = buckets.size() / Group::width;
         size_t hash = hasher(key);
-        size_t index = hash % buckets.size();
-        uint8_t h2 = (hash >> 23) & 0b111111;
-        size_t group_index = index / Group::width;
-        for (size_t i{0}; i < num_groups; ++i) {
+        uint8_t h2 = static_cast<uint8_t>((hash >> 23) & tag_mask);
+        size_t group_index = (hash % buckets.size()) / Group::width;
+        for (size_t i = 0; i < num_groups; ++i) {
             size_t start_group = group_index * Group::width;
             Group group = Group::load(buckets.data() + start_group);
-
+ 
             for (int slot : group.match_byte(occupied_tag(h2))) {
                 size_t idx = start_group + slot;
-                if (values[idx].first != key)
-                    continue;
+                if (values[idx].first != key) continue;
                 if constexpr (concurrent) {
                     std::byte expected{occupied_tag(h2)};
                     if (!buckets[idx].compare_exchange_strong(expected,
@@ -226,26 +251,25 @@ class HashMap {
         }
         return false;
     }
-
+ 
     template <typename F>
     bool write_impl(const Key& key, F&& mutator) {
-        rehash_if_needed();
         size_t num_groups = buckets.size() / Group::width;
         size_t hash = hasher(key);
-        uint8_t h2 = static_cast<uint8_t>((hash >> 23) & 0b111111);
+        uint8_t h2 = static_cast<uint8_t>((hash >> 23) & tag_mask);
         uint8_t tag = occupied_tag(h2);
         size_t group_index = (hash % buckets.size()) / Group::width;
-
-        for (size_t i{0}; i < num_groups; ++i) {
+ 
+        for (size_t i = 0; i < num_groups; ++i) {
             size_t start = group_index * Group::width;
             Group group = Group::load(buckets.data() + start);
-
+ 
             for (int slot : group.match_byte(tag)) {
                 size_t idx = start + slot;
                 if (values[idx].first != key) {
                     continue;
                 }
-
+ 
                 if constexpr (concurrent) {
                     std::byte current = buckets[idx].load(std::memory_order_acquire);
                     if (current != std::byte{tag}) {
@@ -258,14 +282,13 @@ class HashMap {
                         break;
                     }
                     mutator(values[idx].second);
-
                     buckets[idx].store(std::byte{tag}, std::memory_order_release);
                 } else {
                     mutator(values[idx].second);
                 }
                 return true;
             }
-
+ 
             if (group.match_empty().any()) {
                 return false;
             }
@@ -273,140 +296,42 @@ class HashMap {
         }
         return false;
     }
+};
 
-    //----EVERYTHING BELOW THIS LINE IS JUST RESIZE LOGIC(NOT FUN)----//
+struct no_migrate_t {};
+inline constexpr no_migrate_t no_migrate{};
 
-    struct ResizeState {
-        std::vector<std::atomic<std::byte>> new_buckets;
-        std::vector<std::pair<Key, Value>> new_values;
-        std::atomic<size_t> next_chunk;
-        std::atomic<size_t> chunks_remaining;
+template<typename Key, 
+typename Value, 
+size_t LoadFactorNum = 7, 
+size_t LoadFactorDenom = 8,
+typename Hash = std::hash<Key>, 
+typename allocator = std::allocator<std::pair<Key, Value>>> 
+class ConcurrentHashMap{
+    struct submap {
+        std::atomic<std::shared_ptr<submap>> next;
+        HashMap<Key,Value, true, 10, 1, Hash, allocator> map;
     };
+    std::atomic<std::shared_ptr<submap>> head;
+    std::atomic<size_t> num_submaps;
 
-    std::atomic<std::shared_ptr<ResizeState>> active_resize{nullptr};
+    public:
 
-    // this function will set up the ResizeState so that the hash table can be correctly rehashed
-    // and avoid race conditions
-    void try_init_resize() {
-        std::shared_ptr<ResizeState> state = active_resize.load(std::memory_order_acquire);
-        if (!state) {
-            // no resize started, try to set it up
-            size_t num_chunks = buckets.size() / (Group::width * GroupsPerChunk);
-            std::shared_ptr<ResizeState> candidate = std::make_shared<ResizeState>(
-                std::vector<std::atomic<std::byte>>(buckets.size() * 2),
-                std::vector<std::pair<Key, Value>>(buckets.size() * 2),
-                num_chunks,
-                num_chunks);
+    ConcurrentHashMap();
+    ConcurrentHashMap(size_t init_size);
 
-            std::shared_ptr<ResizeState> expected = nullptr;
+    void set_background_thread(size_t ms = 0);//will do bg work, mostly migrating things
+    bool insert(const Key& key, const Value& value) noexcept;
+    bool erase(const Key& key) noexcept;
+    bool write(const Key& key, const Value& value) noexcept;
+    bool write(const Key& key, const Value& value, no_migrate_t) noexcept;
+    bool update(const Key& key, const Value& value) noexcept;
+    bool update(const Key& key, const Value& value, no_migrate_t) noexcept;
+    std::optional<Value> get(const Key& key) noexcept;
+    std::optional<Value> get(const Key& key, no_migrate_t) noexcept;
 
-            if (active_resize.compare_exchange_strong(
-                    expected, candidate, std::memory_order_acq_rel, std::memory_order_relaxed)) {
-                // we won!!!!
-                state = candidate;
-            } else {
-                state = expected;
-            }
-        }
+    size_t size();
 
-        help_migrate(state);
-    }
-
-    void help_migrate(std::shared_ptr<ResizeState> state) {
-        while (true) {
-            size_t claimed = state->next_chunk.fetch_sub(1, std::memory_order_acq_rel);
-            if (claimed == 0) {
-                state->next_chunk.fetch_add(1, std::memory_order_relaxed);
-                while (active_resize.load(std::memory_order_acquire) == state) {
-                    std::this_thread::yield();
-                }
-                return;
-            }
-
-            size_t chunk_id = claimed - 1;
-            migrate_all_slots_in_chunk(*state, chunk_id);
-            if (state->chunks_remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                finish_resize(*state);
-                return;
-            }
-        }
-    }
-
-    void migrate_all_slots_in_chunk(ResizeState& state, size_t chunk_id) {
-        size_t start = chunk_id * GroupsPerChunk * Group::width;
-
-        for (size_t g{0}; g < GroupsPerChunk; ++g) {
-            size_t group_start = start + g * Group::width;
-            Group group = Group::load(buckets.data() + group_start);
-
-            for (int slot : group.match_occupied()) {
-                size_t old_idx = group_start + slot;
-
-                constexpr int max_attempts = 64;
-                for (int attempt = 0; attempt < max_attempts; ++attempt) {
-                    std::byte current = buckets[old_idx].load(std::memory_order_acquire);
-                    std::byte low2 = (current)&std::byte(0b11);
-
-                    if (low2 != occupied_mask) {
-                        if (current == in_progress_mask) {
-                            std::this_thread::yield();
-                            continue;
-                        }
-                        break;
-                    }
-
-                    if (buckets[old_idx].compare_exchange_strong(current,
-                                                                 in_progress_mask,
-                                                                 std::memory_order_acq_rel,
-                                                                 std::memory_order_relaxed)) {
-                        const auto& [key, value] = values[old_idx];
-                        insert_into_new_table(state, key, value);
-                        break;
-                    }
-
-                    if (attempt == max_attempts - 1) {
-                        assert(false && "migration retry exhausted, lost data");
-                    }
-                }
-            }
-        }
-    }
-
-    void insert_into_new_table(ResizeState& state, const Key& key, const Value& value) {
-        size_t num_groups = state.new_buckets.size() / Group::width;
-        size_t hash = hasher(key);
-        uint8_t h2 = static_cast<uint8_t>((hash >> 23) & 0b111111);
-        size_t group_index = (hash % state.new_buckets.size()) / Group::width;
-
-        while (true) {
-            size_t start = group_index * Group::width;
-            Group group = Group::load(state.new_buckets.data() + start);
-
-            simd::Bitmask empty = group.match_empty();
-            if (empty.any()) {
-                size_t idx = start + empty.lowest();
-                std::byte expected{empty_mask};
-                if (state.new_buckets[idx].compare_exchange_strong(expected,
-                                                                   in_progress_mask,
-                                                                   std::memory_order_acq_rel,
-                                                                   std::memory_order_relaxed)) {
-                    state.new_values[idx] = std::make_pair(key, value);
-                    state.new_buckets[idx].store(std::byte{occupied_tag(h2)},
-                                                 std::memory_order_release);
-                    return;
-                }
-                continue;
-            }
-            group_index = (group_index + 1) % num_groups;
-        }
-    }
-
-    void finish_resize(ResizeState& state) {
-        buckets = std::move(state.new_buckets);
-        values = std::move(state.new_values);
-
-        active_resize.store(nullptr, std::memory_order_release);
-    }
 };
 }  // namespace hm
 

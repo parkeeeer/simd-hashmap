@@ -104,7 +104,7 @@ class Group {
 #ifdef __ARM_NEON
         std::byte temp_arr[16];
         for (size_t i{0}; i < 16; ++i) {
-            temp_arr[i] = pos[i].load();
+            temp_arr[i] = pos[i].load(std::memory_order_acquire);
         }
         return load(temp_arr);
 #elif defined(__AVX2__)
