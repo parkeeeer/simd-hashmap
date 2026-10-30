@@ -1,12 +1,6 @@
 #ifndef HASHMAP_SIMD_GROUP_HPP
 #define HASHMAP_SIMD_GROUP_HPP
 
-/**
- * Simd abstraction file for the hashmap
- * I don't want the hashmap file to have any
- * intrinsics in it so I made this file to abstract it away
- */
-
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -39,7 +33,6 @@ class Bitmask {
 #endif
 
     explicit Bitmask(raw_type mask) : mask(mask) {}
-
     [[nodiscard]] bool any() const { return mask != 0; }
     [[nodiscard]] raw_type raw() const { return mask; }
 
@@ -110,7 +103,7 @@ class Group {
 #elif defined(__AVX2__)
         std::byte temp_arr[32];
         for (size_t i{0}; i < 32; ++i) {
-            temp_arr[i] = pos[i].load();
+            temp_arr[i] = pos[i].load(std::memory_order_acquire);
         }
         return load(temp_arr);
 #endif
